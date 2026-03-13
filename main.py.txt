@@ -1,0 +1,136 @@
+import logging, os, flask
+from threading import Thread
+from telegram import Update, LabeledPrice, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, PreCheckoutQueryHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from pymongo import MongoClient
+
+# --- 1. CONFIGURATION ---
+TOKEN = "8736785732:AAFY3Tnar4MXwz7TN9Pb7BEqf88gVcR6OCQ"
+ADMIN_ID = 6548549598
+
+# !!! BADAL <db_password> B PASSWORD DYAL MONGO Atlas !!!
+MONGO_URL = "mongodb+srv://M4TREXX:<marwan@amari123456>@cluster0.yvqevw5.mongodb.net/?appName=Cluster0"
+
+# MongoDB Setup
+try:
+    client = MongoClient(MONGO_URL)
+    db_mongo = client['M4TREXX_STORE']
+    collection = db_mongo['data']
+    logging.info("Connected to MongoDB!")
+except Exception as e:
+    logging.error(f"MongoDB Error: {e}")
+
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# --- 2. WEB SERVER (Bach ybqa 24/7 f Render) ---
+server = flask.Flask('')
+@server.route('/')
+def home(): return "Bot is Alive 24/7!"
+def run(): server.run(host='0.0.0.0', port=8080)
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
+# --- 3. DB FUNCTIONS (Cloud Storage) ---
+def load_db():
+    data = collection.find_one({"_id": "main_store"})
+    if not data:
+        data = {"_id": "main_store", "products": {}, "stats": {"stars": 0, "sold": 0}, "users_list": {}}
+        collection.insert_one(data)
+    return data
+
+def save_db(db):
+    collection.replace_one({"_id": "main_store"}, db)
+
+# --- 4. KEYBOARDS ---
+def main_kb(uid):
+    kb = [
+        [InlineKeyboardButton("🛒 Store", callback_data='open_mkt')],
+        [InlineKeyboardButton("📥 Get File / Info", callback_data='user_files')]
+    ]
+    if int(uid) == ADMIN_ID:
+        kb.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data='open_adm')])
+    return InlineKeyboardMarkup(kb)
+
+# --- 5. HANDLERS ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user; db = load_db()
+    db["users_list"][str(user.id)] = {"name": user.full_name, "username": f"@{user.username}" if user.username else "N/A"}
+    save_db(db)
+    await update.message.reply_text(f"💎 Welcome {user.first_name} to @M4TREXXSTORE", reply_markup=main_kb(user.id))
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; uid = update.effective_user.id; db = load_db()
+    await query.answer()
+
+    if query.data == 'open_mkt':
+        kb = [[InlineKeyboardButton(f"📦 {n} | {p['price']} ⭐", callback_data=f"buy_{n}")] for n, p in db['products'].items()]
+        kb.append([InlineKeyboardButton("⬅️ Back", callback_data='go_home')])
+        await query.edit_message_text("🛍️ **Marketplace:**", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+
+    elif query.data.startswith('buy_'):
+        name = query.data.replace('buy_', ''); p = db['products'].get(name)
+        if p and p['keys']:
+            # L-Bouton l-kbir dyal Pay Stars
+            await context.bot.send_invoice(
+                query.message.chat_id, name, f"Purchase {name}", f"pay_{name}", "", "XTR", [LabeledPrice("Price", p['price'])],
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"Pay ⭐️ {p['price']}", pay=True)]])
+            )
+        else: await query.message.reply_text("❌ Out of stock!")
+
+    elif query.data == 'open_adm' and uid == ADMIN_ID:
+        msg = f"📈 **ADMIN PANEL**\n\n💰 Earned: {db['stats'].get('stars', 0)} ⭐"
+        kb = [[InlineKeyboardButton("🆕 Create Product", callback_data='adm_add')],
+              [InlineKeyboardButton("➕ Add Keys", callback_data='adm_stk')],
+              [InlineKeyboardButton("🗑️ Delete Product", callback_data='adm_del')],
+              [InlineKeyboardButton("⬅️ Back to Home", callback_data='go_home')]]
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+
+    elif query.data == 'adm_del' and uid == ADMIN_ID:
+        kb = [[InlineKeyboardButton(f"❌ Delete {n}", callback_data=f"delp_{n}")] for n in db['products'].keys()]
+        kb.append([InlineKeyboardButton("⬅️ Back", callback_data='open_adm')])
+        await query.edit_message_text("Select to delete:", reply_markup=InlineKeyboardMarkup(kb))
+
+    elif query.data.startswith('delp_'):
+        p_name = query.data.replace('delp_', '')
+        if p_name in db['products']: del db['products'][p_name]; save_db(db)
+        await query.message.reply_text(f"✅ Deleted {p_name}")
+
+    elif query.data == 'go_home':
+        await query.edit_message_text(f"💎 Welcome back", reply_markup=main_kb(uid))
+
+    elif query.data == 'adm_add':
+        context.user_data['st'] = 'wait_name'; await query.message.reply_text("1️⃣ Name:")
+
+# --- STARS LOGIC ---
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.pre_checkout_query.answer(ok=True)
+
+async def success_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pay = update.message.successful_payment; p_name = pay.invoice_payload.replace('pay_', ''); db = load_db()
+    if p_name in db['products'] and db['products'][p_name]['keys']:
+        key = db['products'][p_name]['keys'].pop(0)
+        db['stats']['stars'] += pay.total_amount; save_db(db)
+        await update.message.reply_text(f"✅ **Success!**\n🎁 {p_name}\n🔑 Key: `{key}`", parse_mode='Markdown')
+
+async def handle_inputs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    st = context.user_data.get('st'); db = load_db()
+    if st == 'wait_name':
+        context.user_data['n'] = update.message.text; context.user_data['st'] = 'wait_price'
+        await update.message.reply_text("2️⃣ Price (Stars):")
+    elif st == 'wait_price':
+        db['products'][context.user_data['n']] = {"price": int(update.message.text), "keys": []}
+        save_db(db); context.user_data.clear(); await update.message.reply_text("✅ Product Created!")
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, success_payment_callback))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_inputs))
+    keep_alive()
+    app.run_polling()
+
+if __name__ == '__main__': main()
